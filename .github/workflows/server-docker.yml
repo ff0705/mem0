@@ -1,0 +1,90 @@
+name: 构建server镜像
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Target platforms (e.g. "linux/amd64,linux/arm64")'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+  push:
+    tags: [ "v*.*.*" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/${{ github.event.repository.name }}
+  DEFAULT_PLATFORMS: "linux/amd64,linux/arm64"  # 默认架构
+
+jobs:
+  get-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-tag.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag version
+        id: get-tag
+        run: |
+          TAG=$(git describe --tags --abbrev=0 --match "v*.*.*" 2>/dev/null || echo "v0.1.0")
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          echo "Using version: ${TAG#v}"
+
+  build-push-multiarch:
+    needs: get-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set target platforms
+        id: set-platforms
+        run: |
+          # 使用输入参数或回退到环境变量中的默认值
+          if [ -n "${{ github.event.inputs.platforms }}" ]; then
+            echo "PLATFORMS=${{ github.event.inputs.platforms }}" >> $GITHUB_ENV
+          else
+            echo "PLATFORMS=$DEFAULT_PLATFORMS" >> $GITHUB_ENV
+          fi
+          echo "Using platforms: $PLATFORMS"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: ${{ env.PLATFORMS }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./server/dev.Dockerfile
+          platforms: ${{ env.TARGET_PLATFORMS }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.get-version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.repository_url }}
+            org.opencontainers.image.version=${{ needs.get-version.outputs.version }}
+
+      - name: Show build result
+        run: |
+          echo "Successfully built for platforms: ${{ env.TARGET_PLATFORMS }}"
+          echo "Image URL: ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.get-version.outputs.version }}"

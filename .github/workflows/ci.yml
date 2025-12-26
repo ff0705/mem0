@@ -1,17 +1,7 @@
 name: ci
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'mem0/**'
-      - 'tests/**'
-      - 'embedchain/**'
-  pull_request:
-    paths:
-      - 'mem0/**'
-      - 'tests/**'
-      - 'embedchain/**'
+  workflow_dispatch:
 
 jobs:
   check_changes:
