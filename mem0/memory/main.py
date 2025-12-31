@@ -1414,6 +1414,7 @@ class AsyncMemory(MemoryBase):
         effective_filters: dict,
         infer: bool,
     ):
+        global combined_meta
         if not infer:
             returned_memories = []
             for message_dict in messages:
@@ -1446,6 +1447,7 @@ class AsyncMemory(MemoryBase):
                         "event": "ADD",
                         "actor_id": actor_name if actor_name else None,
                         "role": message_dict["role"],
+                        "metadata": per_msg_meta,
                     }
                 )
             return returned_memories
@@ -1465,27 +1467,57 @@ class AsyncMemory(MemoryBase):
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
             response_format={"type": "json_object"},
         )
+        # 替换你代码中的 JSON 解析部分
         try:
             response = remove_code_blocks(response)
             if not response.strip():
                 new_retrieved_facts = []
+                new_retrieved_metadata = []  # 修正：事实列表对应 metadata 列表，初始化为空列表
             else:
                 try:
                     # First try direct JSON parsing
-                    new_retrieved_facts = json.loads(response)["facts"]
+                    response_json = json.loads(response)
+                    new_retrieved_facts = response_json.get("facts", [])  # 兜底为空列表
+                    # 修正：metadata 两种情况兼容
+                    # 情况1：返回的是单个字典（所有fact共用）
+                    meta_data = response_json.get("metadata", {})
+                    # 情况2：返回的是字典列表（和 facts 一一对应）
+                    if isinstance(meta_data, list):
+                        new_retrieved_metadata = meta_data
+                    else:
+                        # 若为单个字典，复制为和 facts 长度一致的列表，确保一一对应
+                        new_retrieved_metadata = [deepcopy(meta_data) for _ in new_retrieved_facts]
                 except json.JSONDecodeError:
                     # Try extracting JSON from response using built-in function
                     extracted_json = extract_json(response)
-                    new_retrieved_facts = json.loads(extracted_json)["facts"]
+                    response_json = json.loads(extracted_json)
+                    new_retrieved_facts = response_json.get("facts", [])
+                    meta_data = response_json.get("metadata", {})
+                    if isinstance(meta_data, list):
+                        new_retrieved_metadata = meta_data
+                    else:
+                        new_retrieved_metadata = [deepcopy(meta_data) for _ in new_retrieved_facts]
         except Exception as e:
             logger.error(f"Error in new_retrieved_facts: {e}")
             new_retrieved_facts = []
+            new_retrieved_metadata = []  # 修正：异常时初始化为空列表
+
+         # 新增：校验facts和metadata长度一致，不一致则截断/补空
+        if len(new_retrieved_facts) != len(new_retrieved_metadata):
+            logger.warning(
+                f"Facts({len(new_retrieved_facts)}) and Metadata({len(new_retrieved_metadata)}) length mismatch, aligning...")
+            # 取较短的长度，截断较长的数组
+            min_len = min(len(new_retrieved_facts), len(new_retrieved_metadata))
+            new_retrieved_facts = new_retrieved_facts[:min_len]
+            new_retrieved_metadata = new_retrieved_metadata[:min_len]
 
         if not new_retrieved_facts:
             logger.debug("No new facts retrieved from input. Skipping memory update LLM call.")
 
         retrieved_old_memory = []
         new_message_embeddings = {}
+        # 新增：存储每个fact对应的metadata
+        new_fact_metadata_mapping = dict(zip(new_retrieved_facts, new_retrieved_metadata))  # {fact: metadata}
         # Search for existing memories using the provided session identifiers
         # Use all available session identifiers for accurate memory retrieval
         search_filters = {}
@@ -1560,28 +1592,41 @@ class AsyncMemory(MemoryBase):
                         continue
                     event_type = resp.get("event")
 
+                    # 恢复并修正：获取当前fact对应的metadata（如果存在）
+                    fact_metadata = new_fact_metadata_mapping.get(action_text, {})  # 单个fact的metadata（字典）
+                    # 合并基础 metadata（metadata 是字典，来自外部传入）和 fact 专属 metadata
+                    combined_meta = deepcopy(metadata)  # 基础metadata是字典，确保 combined_meta 初始为字典
+                    # 合并：若 fact_metadata 是字典，更新到 combined_meta（字典的 update 方法）
+                    if isinstance(fact_metadata, dict):
+                        combined_meta.update(fact_metadata)
+
                     if event_type == "ADD":
                         task = asyncio.create_task(
                             self._create_memory(
                                 data=action_text,
                                 existing_embeddings=new_message_embeddings,
-                                metadata=deepcopy(metadata),
+                                #metadata=deepcopy(metadata),
+                                metadata=combined_meta,  # 使用合并后的metadata
                             )
                         )
-                        memory_tasks.append((task, resp, "ADD", None))
+                        # memory_tasks.append((task, resp, "ADD", None))
+                        memory_tasks.append((task, resp, "ADD", combined_meta))  # 新增：携带metadata
                     elif event_type == "UPDATE":
                         task = asyncio.create_task(
                             self._update_memory(
                                 memory_id=temp_uuid_mapping[resp["id"]],
                                 data=action_text,
                                 existing_embeddings=new_message_embeddings,
-                                metadata=deepcopy(metadata),
+                                #metadata=deepcopy(metadata),
+                                metadata=combined_meta,  # 使用合并后的metadata
                             )
                         )
-                        memory_tasks.append((task, resp, "UPDATE", temp_uuid_mapping[resp["id"]]))
+                        # memory_tasks.append((task, resp, "UPDATE", temp_uuid_mapping[resp["id"]]))
+                        memory_tasks.append((task, resp, "UPDATE", temp_uuid_mapping[resp["id"]], combined_meta))
                     elif event_type == "DELETE":
                         task = asyncio.create_task(self._delete_memory(memory_id=temp_uuid_mapping[resp.get("id")]))
-                        memory_tasks.append((task, resp, "DELETE", temp_uuid_mapping[resp.get("id")]))
+                        #memory_tasks.append((task, resp, "DELETE", temp_uuid_mapping[resp.get("id")]))
+                        memory_tasks.append((task, resp, "DELETE", temp_uuid_mapping[resp.get("id")], {}))
                     elif event_type == "NONE":
                         # Even if content doesn't need updating, update session IDs if provided
                         memory_id = temp_uuid_mapping.get(resp.get("id"))
@@ -1605,7 +1650,8 @@ class AsyncMemory(MemoryBase):
                                 logger.info(f"Updated session IDs for memory {mem_id} (async)")
 
                             task = asyncio.create_task(update_session_ids(memory_id, metadata))
-                            memory_tasks.append((task, resp, "NONE", memory_id))
+                            # memory_tasks.append((task, resp, "NONE", memory_id))
+                            memory_tasks.append((task, resp, "NONE", memory_id, {}))
                         else:
                             logger.info("NOOP for Memory (async).")
                 except Exception as e:
@@ -1615,7 +1661,13 @@ class AsyncMemory(MemoryBase):
                 try:
                     result_id = await task
                     if event_type == "ADD":
-                        returned_memories.append({"id": result_id, "memory": resp.get("text"), "event": event_type})
+                        #returned_memories.append({"id": result_id, "memory": resp.get("text"), "event": event_type})
+                        returned_memories.append({
+                            "id": result_id,
+                            "memory": resp.get("text"),
+                            "event": event_type,
+                            "metadata": combined_meta  # 返回ADD的metadata
+                        })
                     elif event_type == "UPDATE":
                         returned_memories.append(
                             {
@@ -1623,10 +1675,24 @@ class AsyncMemory(MemoryBase):
                                 "memory": resp.get("text"),
                                 "event": event_type,
                                 "previous_memory": resp.get("old_memory"),
+                                "metadata": combined_meta  # 返回UPDATE的metadata
                             }
                         )
                     elif event_type == "DELETE":
-                        returned_memories.append({"id": mem_id, "memory": resp.get("text"), "event": event_type})
+                        #returned_memories.append({"id": mem_id, "memory": resp.get("text"), "event": event_type})
+                        returned_memories.append({
+                            "id": mem_id,
+                            "memory": resp.get("text"),
+                            "event": event_type,
+                            "metadata": combined_meta  # 新增：返回DELETE的metadata
+                        })
+                    elif event_type == "NONE":
+                        returned_memories.append({
+                            "id": mem_id,
+                            "memory": resp.get("text"),
+                            "event": event_type,
+                            "metadata": combined_meta  # 新增：返回NONE的metadata
+                        })
                 except Exception as e:
                     logger.error(f"Error awaiting memory task (async): {e}")
         except Exception as e:
