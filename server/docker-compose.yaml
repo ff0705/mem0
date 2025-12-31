@@ -5,6 +5,7 @@ services:
     build:
       context: ..  # Set context to parent directory
       dockerfile: server/dev.Dockerfile
+    image: local/mem0-1.0.0:latest
     ports:
       - "8888:8000"
     env_file:
